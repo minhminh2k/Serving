@@ -2,7 +2,7 @@ import torch
 from diffusers import AutoencoderKL
 from transformers import CLIPTextModel, CLIPTokenizer
 
-huggingface_cached = "/mnt/nvme1n1/duong.quang.minh/huggingface_cached"
+huggingface_cached = "/home/duong.quang.minh/project/packtech-innovate/sunec/triton/huggingface_cached"
 
 prompt = "Draw a dog"
 vae = AutoencoderKL.from_pretrained(
@@ -18,11 +18,13 @@ text_encoder = CLIPTextModel.from_pretrained(
     cache_dir=huggingface_cached
 )
 
+# Only get the decoder part of the VAE
 vae.forward = vae.decode
+
 torch.onnx.export(
     vae,
     (torch.randn(1, 4, 64, 64), False),
-    "vae.onnx",
+    "models/vae.onnx",
     input_names=["latent_sample", "return_dict"],
     output_names=["sample"],
     dynamic_axes={
@@ -40,10 +42,12 @@ text_input = tokenizer(
     return_tensors="pt",
 )
 
+print("Text encoder input shape: ", text_input.input_ids.shape) # torch.Size([1, 77])
+
 torch.onnx.export(
     text_encoder,
     (text_input.input_ids.to(torch.int32)),
-    "encoder.onnx",
+    "models/encoder.onnx",
     input_names=["input_ids"],
     output_names=["last_hidden_state", "pooler_output"],
     dynamic_axes={

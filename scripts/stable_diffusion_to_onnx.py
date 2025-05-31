@@ -11,6 +11,7 @@ from torch.onnx import export
 from diffusers import OnnxRuntimeModel, OnnxStableDiffusionPipeline, StableDiffusionPipeline
 
 
+
 is_torch_less_than_1_11 = version.parse(version.parse(torch.__version__).base_version) < version.parse("1.11")
 
 
@@ -54,7 +55,13 @@ def onnx_export(
 
 
 @torch.no_grad()
-def convert_models(model_path: str, output_path: str, opset: int, fp16: bool = False):
+def convert_models(
+    model_path: str, 
+    huggingface_cached: str,
+    output_path: str, 
+    opset: int, 
+    fp16: bool = False
+):
     dtype = torch.float16 if fp16 else torch.float32
     if fp16 and torch.cuda.is_available():
         device = "cuda"
@@ -62,7 +69,11 @@ def convert_models(model_path: str, output_path: str, opset: int, fp16: bool = F
         raise ValueError("`float16` model export is only supported on GPUs with CUDA")
     else:
         device = "cpu"
-    pipeline = StableDiffusionPipeline.from_pretrained(model_path, torch_dtype=dtype).to(device)
+    pipeline = StableDiffusionPipeline.from_pretrained(
+        model_path, 
+        torch_dtype=dtype,
+        cache_dir=huggingface_cached
+    ).to(device)
     output_path = Path(output_path)
 
     # TEXT ENCODER
@@ -110,7 +121,7 @@ def convert_models(model_path: str, output_path: str, opset: int, fp16: bool = F
             "encoder_hidden_states": {0: "batch", 1: "sequence"},
         },
         opset=opset,
-        use_external_data_format=True,  # UNet is > 2GB, so the weights need to be split
+        use_external_data_format=True, # UNet is > 2GB, so the weights need to be split
     )
     unet_model_path = str(unet_path.absolute().as_posix())
     unet_dir = os.path.dirname(unet_model_path)
@@ -232,11 +243,23 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model_path",
         type=str,
-        required=True,
+        default= "CompVis/stable-diffusion-v1-4",
         help="Path to the `diffusers` checkpoint to convert (either a local directory or on the Hub).",
     )
 
-    parser.add_argument("--output_path", type=str, required=True, help="Path to the output model.")
+    parser.add_argument(
+        "--huggingface_cached",
+        type=str,
+        default="/home/duong.quang.minh/project/Serving/huggingface_cached",
+        help="Path to the huggingface cached path.",
+    )
+
+    parser.add_argument(
+        "--output_path", 
+        type=str, 
+        default="onnx/",
+        help="Path to the output model."
+    )
 
     parser.add_argument(
         "--opset",
@@ -248,4 +271,4 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    convert_models(args.model_path, args.output_path, args.opset, args.fp16)
+    convert_models(args.model_path, args.huggingface_cached, args.output_path, args.opset, args.fp16)
