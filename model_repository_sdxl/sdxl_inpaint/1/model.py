@@ -59,6 +59,12 @@ class TritonPythonModel:
             self.stable_diffusion_path + "/1/tokenizer/",
             cache_dir=self.cache_dir
         )
+
+        self.tokenizer_2 = CLIPTokenizer.from_pretrained(
+            self.stable_diffusion_path + "/1/tokenizer_2/",
+            cache_dir=self.cache_dir
+        )
+
         self.scheduler_config_path = self.stable_diffusion_path + "/1/scheduler/"
         self.scheduler = DPMSolverMultistepScheduler.from_config(self.scheduler_config_path)
 
