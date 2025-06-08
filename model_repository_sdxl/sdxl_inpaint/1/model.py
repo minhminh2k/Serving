@@ -1,6 +1,7 @@
 import inspect
 import logging
 
+from typing import Optional, Any, Literal, Tuple, List
 from pathlib import Path
 from typing import Dict, List, Union
 
@@ -18,13 +19,20 @@ from diffusers.schedulers import (
 )
 from diffusers import StableDiffusionXLInpaintPipeline
 from optimum.onnxruntime import ORTStableDiffusionXLInpaintPipeline
-
+from diffusers.image_processor import VaeImageProcessor
+from diffusers.utils.torch_utils import randn_tensor
 
 try:
     # noinspection PyUnresolvedReferences
     import triton_python_backend_utils as pb_utils
 except ImportError:
     pass  # triton_python_backend_utils exists only inside Triton Python backend.
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 
 
 class TritonPythonModel:
@@ -53,7 +61,7 @@ class TritonPythonModel:
         
         self.cache_dir = "/huggingface_cached"
         
-        self.stable_diffusion_path = "/models/stable_diffusion_pipeline"
+        self.stable_diffusion_path = "/models/sdxl_inpaint"
         
         self.tokenizer = CLIPTokenizer.from_pretrained(
             self.stable_diffusion_path + "/1/tokenizer/",
@@ -66,13 +74,24 @@ class TritonPythonModel:
         )
 
         self.scheduler_config_path = self.stable_diffusion_path + "/1/scheduler/"
-        self.scheduler = DPMSolverMultistepScheduler.from_config(self.scheduler_config_path)
+        self.scheduler = EulerDiscreteScheduler.from_config(self.scheduler_config_path)
 
-        self.height = 512
-        self.width = 512
-        self.num_inference_steps = 50
-        self.guidance_scale = 7.5
+        self.vae_scale_factor = 8
+
+        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
+        self.mask_processor = VaeImageProcessor(
+            vae_scale_factor=self.vae_scale_factor, do_normalize=False, do_binarize=True, do_convert_grayscale=True
+        )
+
+        self.height = 1024 # = self.unet.config.sample_size (128) * self.vae_scale_factor (8)
+        self.width = 1024
+        self.num_inference_steps = 20
+        self.guidance_scale = 8.0
+        self.strength = 0.9999
         self.eta = 0.0
+        self.scaling_factor = 0.13025
+        self.text_encoder_projection_dim = 1280
+
 
     def execute(self, requests) -> "List[List[pb_utils.Tensor]]":
         """
@@ -80,10 +99,25 @@ class TritonPythonModel:
         :param requests: 1 or more requests received by Triton server.
         :return: text as input tensors
         """
+        from optimum.onnxruntime import ORTStableDiffusionXLInpaintPipeline
         responses = []
         # for loop for batch requests (disabled in our case)
         for request in requests:
-            # binary data typed back to string
+            
+            image = [
+                t.decode("UTF-8")
+                for t in pb_utils.get_input_tensor_by_name(request, "IMAGE")
+                .as_numpy()
+                .tolist()
+            ]
+
+            mask_image = [
+                t.decode("UTF-8")
+                for t in pb_utils.get_input_tensor_by_name(request, "MASK_IMAGE")
+                .as_numpy()
+                .tolist()
+            ]
+
             prompt = [
                 t.decode("UTF-8")
                 for t in pb_utils.get_input_tensor_by_name(request, "PROMPT")
@@ -131,101 +165,49 @@ class TritonPythonModel:
                 .tolist()
             ][0]
 
+            batch_size = len(prompt)
+            generator = torch.Generator(device=self.device).manual_seed(seed)
             ## Fix later
             if negative_prompt[0] == "NONE":
                 negative_prompt = None
+            
+            # Encode Prompt
+            tokenizers = [self.tokenizer, self.tokenizer_2] if self.tokenizer_2 is not None else [self.tokenizer]
+            text_encoders = ["text_encoder", "text_encoder_2"] if self.tokenizer_2 is not None else ["text_encoder"]
+            
+            prompt_2 = prompt
+            prompt_embeds_list = []
+            prompts = [prompt, prompt_2]
+            
+            for prompt, tokenizer, text_encoder in zip(prompts, tokenizers, text_encoders):
 
-            # get prompt text embeddings
-            text_input = self.tokenizer(
-                prompt,
-                padding="max_length",
-                max_length=self.tokenizer.model_max_length,
-                return_tensors="pt",
-            )
-            text_input_ids = text_input.input_ids
-            if text_input_ids.shape[-1] > self.tokenizer.model_max_length:
-                removed_text = self.tokenizer.batch_decode(
-                    text_input_ids[:, self.tokenizer.model_max_length :]
-                )
-                logging.warning(
-                    "The following part of your input was truncated because CLIP can only handle sequences up to"
-                    f" {self.tokenizer.model_max_length} tokens: {removed_text}"
-                )
-                text_input_ids = text_input_ids[:, : self.tokenizer.model_max_length]
-
-            input_ids = text_input_ids.type(dtype=torch.int32)
-            inputs = [
-                pb_utils.Tensor.from_dlpack("input_ids", torch.to_dlpack(input_ids))
-            ]
-
-            inference_request = pb_utils.InferenceRequest(
-                model_name="text_encoder",
-                requested_output_names=["last_hidden_state"],
-                inputs=inputs,
-            )
-            inference_response = inference_request.exec()
-            if inference_response.has_error():
-                raise pb_utils.TritonModelException(
-                    inference_response.error().message()
-                )
-            else:
-                output = pb_utils.get_output_tensor_by_name(
-                    inference_response, "last_hidden_state"
-                )
-                text_embeddings: torch.Tensor = torch.from_dlpack(output.to_dlpack())
-
-            # duplicate text embeddings for each generation per prompt, using mps friendly method
-            bs_embed, seq_len, _ = text_embeddings.shape
-            text_embeddings = text_embeddings.repeat(1, num_images_per_prompt, 1)
-            text_embeddings = text_embeddings.view(
-                bs_embed * num_images_per_prompt, seq_len, -1
-            )
-
-            # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
-            # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
-            # corresponds to doing no classifier free guidance.
-            do_classifier_free_guidance = self.guidance_scale > 1.0
-            # get unconditional embeddings for classifier free guidance
-            batch_size = 1
-            if do_classifier_free_guidance:
-                uncond_tokens: List[str]
-                if negative_prompt is None:
-                    uncond_tokens = [""] * batch_size
-                elif type(prompt) is not type(negative_prompt):
-                    raise TypeError(
-                        f"`negative_prompt` should be the same type to `prompt`, but got {type(negative_prompt)} !="
-                        f" {type(prompt)}."
-                    )
-                elif isinstance(negative_prompt, str):
-                    uncond_tokens = [negative_prompt]
-                elif batch_size != len(negative_prompt):
-                    raise ValueError(
-                        f"`negative_prompt`: {negative_prompt} has batch size {len(negative_prompt)}, but `prompt`:"
-                        f" {prompt} has batch size {batch_size}. Please make sure that passed `negative_prompt` matches"
-                        " the batch size of `prompt`."
-                    )
-                else:
-                    uncond_tokens = negative_prompt
-
-                max_length = text_input_ids.shape[-1]
-                uncond_input = self.tokenizer(
-                    uncond_tokens,
+                text_inputs = tokenizer(
+                    prompt,
                     padding="max_length",
-                    max_length=max_length,
+                    max_length=tokenizer.model_max_length,
                     truncation=True,
                     return_tensors="pt",
                 )
 
-                # For classifier free guidance, we need to do two forward passes.
-                # Here we concatenate the unconditional and text embeddings into a single batch
-                # to avoid doing two forward passes
-                input_ids = uncond_input.input_ids.type(dtype=torch.int32)
+                text_input_ids = text_inputs.input_ids
+                untruncated_ids = tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
+
+                if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(
+                    text_input_ids, untruncated_ids
+                ):
+                    removed_text = tokenizer.batch_decode(untruncated_ids[:, tokenizer.model_max_length - 1 : -1])
+                    logging.warning(
+                        "The following part of your input was truncated because CLIP can only handle sequences up to"
+                        f" {tokenizer.model_max_length} tokens: {removed_text}"
+                    )
+
+                input_ids = text_input_ids.type(dtype=torch.int32)
                 inputs = [
                     pb_utils.Tensor.from_dlpack("input_ids", torch.to_dlpack(input_ids))
                 ]
 
                 inference_request = pb_utils.InferenceRequest(
-                    model_name="text_encoder",
+                    model_name=text_encoder,
                     requested_output_names=["last_hidden_state"],
                     inputs=inputs,
                 )
@@ -238,87 +220,273 @@ class TritonPythonModel:
                     output = pb_utils.get_output_tensor_by_name(
                         inference_response, "last_hidden_state"
                     )
-                    uncond_embeddings: torch.Tensor = torch.from_dlpack(
-                        output.to_dlpack()
+                    prompt_embeds: torch.Tensor = torch.from_dlpack(output.to_dlpack())
+
+                pooled_prompt_embeds = prompt_embeds[0]
+
+                prompt_embeds = prompt_embeds.hidden_states[-2]
+
+                prompt_embeds_list.append(prompt_embeds)
+
+            prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
+            do_classifier_free_guidance = self.guidance_scale > 1.0
+
+            zero_out_negative_prompt = negative_prompt is None or negative_prompt == "NONE"
+            if do_classifier_free_guidance and zero_out_negative_prompt:
+                negative_prompt = negative_prompt or ""
+                negative_prompt_2 = negative_prompt_2 or negative_prompt
+            
+                # normalize str to list
+                negative_prompt = batch_size * [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
+                negative_prompt_2 = (
+                    batch_size * [negative_prompt_2] if isinstance(negative_prompt_2, str) else negative_prompt_2
+                )
+
+                uncond_tokens: List[str]
+                if prompt is not None and type(prompt) is not type(negative_prompt):
+                    raise TypeError(
+                        f"`negative_prompt` should be the same type to `prompt`, but got {type(negative_prompt)} !="
+                        f" {type(prompt)}."
+                    )
+                elif batch_size != len(negative_prompt):
+                    raise ValueError(
+                        f"`negative_prompt`: {negative_prompt} has batch size {len(negative_prompt)}, but `prompt`:"
+                        f" {prompt} has batch size {batch_size}. Please make sure that passed `negative_prompt` matches"
+                        " the batch size of `prompt`."
+                    )
+                else:
+                    uncond_tokens = [negative_prompt, negative_prompt_2]
+
+                negative_prompt_embeds_list = []
+                for negative_prompt, tokenizer, text_encoder in zip(uncond_tokens, tokenizers, text_encoders):
+                    max_length = prompt_embeds.shape[1]
+                    uncond_input = tokenizer(
+                        negative_prompt,
+                        padding="max_length",
+                        max_length=max_length,
+                        truncation=True,
+                        return_tensors="pt",
                     )
 
-                # duplicate unconditional embeddings for each generation per prompt, using mps friendly method
-                seq_len = uncond_embeddings.shape[1]
-                uncond_embeddings = uncond_embeddings.repeat(
-                    1, num_images_per_prompt, 1
+                    # negative_prompt_embeds = text_encoder(
+                    #     uncond_input.input_ids.to(self.device),
+                    #     output_hidden_states=True,
+                    # )
+
+                    input_ids = uncond_input.type(dtype=torch.int32)
+                    inputs = [
+                        pb_utils.Tensor.from_dlpack("input_ids", torch.to_dlpack(input_ids))
+                    ]
+
+                    inference_request = pb_utils.InferenceRequest(
+                        model_name=text_encoder,
+                        requested_output_names=["last_hidden_state"],
+                        inputs=inputs,
+                    )
+                    inference_response = inference_request.exec()
+                    if inference_response.has_error():
+                        raise pb_utils.TritonModelException(
+                            inference_response.error().message()
+                        )
+                    else:
+                        output = pb_utils.get_output_tensor_by_name(
+                            inference_response, "last_hidden_state"
+                        )
+                        negative_prompt_embeds: torch.Tensor = torch.from_dlpack(output.to_dlpack())
+
+
+                    # We are only ALWAYS interested in the pooled output of the final text encoder
+                    negative_pooled_prompt_embeds = negative_prompt_embeds[0]
+                    negative_prompt_embeds = negative_prompt_embeds.hidden_states[-2]
+
+                    negative_prompt_embeds_list.append(negative_prompt_embeds)
+
+                negative_prompt_embeds = torch.concat(negative_prompt_embeds_list, dim=-1)
+
+                prompt_embeds = prompt_embeds.to(self.device, dtype=torch.float16)
+
+                bs_embed, seq_len, _ = prompt_embeds.shape
+                # duplicate text embeddings for each generation per prompt, using mps friendly method
+                prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
+                prompt_embeds = prompt_embeds.view(bs_embed * num_images_per_prompt, seq_len, -1)
+
+                if do_classifier_free_guidance:
+                    # duplicate unconditional embeddings for each generation per prompt, using mps friendly method
+                    seq_len = negative_prompt_embeds.shape[1]
+                    negative_prompt_embeds = negative_prompt_embeds.to(dtype=torch.float16, device=self.device)
+                    negative_prompt_embeds = negative_prompt_embeds.repeat(1, num_images_per_prompt, 1)
+                    negative_prompt_embeds = negative_prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+
+                pooled_prompt_embeds = pooled_prompt_embeds.repeat(1, num_images_per_prompt).view(
+                    bs_embed * num_images_per_prompt, -1
                 )
-                uncond_embeddings = uncond_embeddings.view(
-                    batch_size * num_images_per_prompt, seq_len, -1
+                negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.repeat(1, num_images_per_prompt).view(
+                    bs_embed * num_images_per_prompt, -1
                 )
 
-                # For classifier free guidance, we need to do two forward passes.
-                # Here we concatenate the unconditional and text embeddings into a single batch
-                # to avoid doing two forward passes
-                text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
+                # Not using unscale lora layers: USE_PEFT_BACKEND = False
+                # return prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds
 
-            # get the initial random noise unless the user supplied it
 
-            latents_shape = (
-                batch_size * num_images_per_prompt,
-                4,
-                self.height // 8,
-                self.width // 8,
-            )
-            generator = torch.Generator(device=self.device).manual_seed(seed)
-            latents = torch.randn(
-                latents_shape, generator=generator, device=self.device
-            )
-
-            # set timesteps
             self.scheduler.set_timesteps(self.num_inference_steps, device=self.device)
+            timesteps = self.scheduler.timesteps
+            init_timestep = min(int(self.num_inference_steps * self.strength), self.num_inference_steps)
+            t_start = max(self.num_inference_steps - init_timestep, 0)
+            timesteps, num_inference_steps = timesteps, self.num_inference_steps - t_start
 
-            timesteps_tensor = self.scheduler.timesteps
+            timesteps = self.scheduler.timesteps[t_start * self.scheduler.order :]
 
-            # scale the initial noise by the standard deviation required by the scheduler
-            latents = latents * self.scheduler.init_noise_sigma
+            # at which timestep to set the initial noise (n.b. 50% if strength is 0.5)
+            latent_timestep = timesteps[:1].repeat(batch_size * num_images_per_prompt)
+            # create a boolean to check if the strength is set to 1. if so then initialise the latents with pure noise
+            is_strength_max = self.strength == 1.0
 
-            # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
-            # eta (η) is only used with the DDIMScheduler, it will be ignored for other schedulers.
-            # eta corresponds to η in DDIM paper: https://arxiv.org/abs/2010.02502
-            # and should be between [0, 1]
+            # 5. Preprocess mask and image
+            init_image = self.image_processor.preprocess(image, height=self.height, width=self.width)
+            init_image = init_image.to(dtype=torch.float32)
 
-            # StableDiffusionPipeline: 6. Prepare extra step kwargs.
-            accepts_eta = "eta" in set(
-                inspect.signature(self.scheduler.step).parameters.keys()
+            mask = self.mask_processor.preprocess(mask_image, height=self.height, width=self.width)
+            
+            if init_image.shape[1] == 4:
+                # if images are in latent space, we can't mask it
+                masked_image = None
+            else:
+                masked_image = init_image * (mask < 0.5)
+
+            # 6. Prepare latent variables
+            num_channels_latents = self.vae.config.latent_channels
+            num_channels_unet = self.unet.config.in_channels
+            return_image_latents = num_channels_unet == 4
+
+            add_noise = True
+            latents_outputs = self.prepare_latents(
+                batch_size * num_images_per_prompt,
+                num_channels_latents,
+                self.height,
+                self.width,
+                prompt_embeds.dtype,
+                self.device,
+                generator,
+                latents,
+                image=init_image,
+                timestep=latent_timestep,
+                is_strength_max=is_strength_max,
+                add_noise=add_noise,
+                return_noise=True,
+                return_image_latents=return_image_latents,
             )
-            extra_step_kwargs = {}
-            if accepts_eta:
-                extra_step_kwargs["eta"] = self.eta
 
-            # check if the scheduler accepts generator
-            accepts_generator = "generator" in set(
-                inspect.signature(self.scheduler.step).parameters.keys()
+            if return_image_latents:
+                latents, noise, image_latents = latents_outputs
+            else:
+                latents, noise = latents_outputs
+
+            mask, masked_image_latents = self.prepare_mask_latents(
+                mask,
+                masked_image,
+                batch_size * num_images_per_prompt,
+                self.height,
+                self.width,
+                prompt_embeds.dtype,
+                self.device,
+                generator,
+                do_classifier_free_guidance,
             )
-            if accepts_generator:
-                extra_step_kwargs["generator"] = generator
 
-            # StableDiffusionPipeline: 7. Denoising loop
-            for i, t in enumerate(timesteps_tensor):
+            # 8. Check that sizes of mask, masked image and latents match
+            if num_channels_unet == 9:
+                # default case for runwayml/stable-diffusion-inpainting
+                num_channels_mask = mask.shape[1]
+                num_channels_masked_image = masked_image_latents.shape[1]
+                if num_channels_latents + num_channels_mask + num_channels_masked_image != self.unet.config.in_channels:
+                    raise ValueError(
+                        f"Incorrect configuration settings! The config of `pipeline.unet`: {self.unet.config} expects"
+                        f" {self.unet.config.in_channels} but received `num_channels_latents`: {num_channels_latents} +"
+                        f" `num_channels_mask`: {num_channels_mask} + `num_channels_masked_image`: {num_channels_masked_image}"
+                        f" = {num_channels_latents+num_channels_masked_image+num_channels_mask}. Please verify the config of"
+                        " `pipeline.unet` or your `mask_image` or `image` input."
+                    )
+            elif num_channels_unet != 4:
+                raise ValueError(
+                    f"The unet {self.unet.__class__} should have either 4 or 9 input channels, not {self.unet.config.in_channels}."
+                )
+
+            extra_step_kwargs = self.prepare_extra_step_kwargs(generator, self.eta)
+
+            # 9. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
+            height, width = latents.shape[-2:]
+            height = height * self.vae_scale_factor
+            width = width * self.vae_scale_factor
+
+            original_size = original_size or (height, width)
+            target_size = target_size or (height, width)
+
+            # 10. Prepare added time ids & embeddings
+            if negative_original_size is None:
+                negative_original_size = original_size
+            if negative_target_size is None:
+                negative_target_size = target_size
+            
+            add_text_embeds = pooled_prompt_embeds
+            text_encoder_projection_dim = self.text_encoder_projection_dim
+
+            add_time_ids, add_neg_time_ids = self._get_add_time_ids(
+                original_size,
+                crops_coords_top_left=(0,0),
+                target_size=None,
+                aesthetic_score=6.0,
+                negative_aesthetic_score=2.5,
+                negative_original_size=None,
+                negative_crops_coords_top_left=(0, 0),
+                negative_target_size=None,
+                dtype=prompt_embeds.dtype,
+                text_encoder_projection_dim=text_encoder_projection_dim,
+            )
+            add_time_ids = add_time_ids.repeat(batch_size * num_images_per_prompt, 1)
+
+            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+            add_text_embeds = torch.cat([negative_pooled_prompt_embeds, add_text_embeds], dim=0)
+            add_neg_time_ids = add_neg_time_ids.repeat(batch_size * num_images_per_prompt, 1)
+            add_time_ids = torch.cat([add_neg_time_ids, add_time_ids], dim=0)
+
+            prompt_embeds = prompt_embeds.to(self.device)
+            add_text_embeds = add_text_embeds.to(self.device)
+            add_time_ids = add_time_ids.to(self.device)
+
+            # 11. Denoising loop
+            num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
+
+            # 11.1 Optionally get Guidance Scale Embedding
+            timestep_cond = None
+            self._num_timesteps = len(timesteps)
+
+
+            for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
-                latent_model_input = (
-                    torch.cat([latents] * 2) if do_classifier_free_guidance else latents
-                )
-                latent_model_input = self.scheduler.scale_model_input(
-                    latent_model_input, t
-                )
+                latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
 
-                latent_model_input = latent_model_input.type(dtype=torch.float32)
-                timestep = t[None].type(dtype=torch.float32)
-                encoder_hidden_states = text_embeddings.type(dtype=torch.float32)
+                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+                if num_channels_unet == 9:
+                    latent_model_input = torch.cat([latent_model_input, mask, masked_image_latents], dim=1)
 
                 inputs = [
                     pb_utils.Tensor.from_dlpack(
                         "sample", torch.to_dlpack(latent_model_input)
                     ),
-                    pb_utils.Tensor.from_dlpack("timestep", torch.to_dlpack(timestep)),
+                    pb_utils.Tensor.from_dlpack("timestep", torch.to_dlpack(t)),
                     pb_utils.Tensor.from_dlpack(
-                        "encoder_hidden_states", torch.to_dlpack(encoder_hidden_states)
+                        "encoder_hidden_states", torch.to_dlpack(prompt_embeds)
                     ),
+                    pb_utils.Tensor.from_dlpack(
+                        "text_embeds", torch.to_dlpack(add_text_embeds)
+                    ),
+                    pb_utils.Tensor.from_dlpack(
+                        "time_ids", torch.to_dlpack(add_time_ids)
+                    ),
+                    pb_utils.Tensor.from_dlpack(
+                        "return_dict", torch.to_dlpack(False)
+                    )
                 ]
 
                 inference_request = pb_utils.InferenceRequest(
@@ -340,22 +508,35 @@ class TritonPythonModel:
                 # perform guidance
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + self.guidance_scale * (
-                        noise_pred_text - noise_pred_uncond
-                    )
+                    noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-                # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(
-                    noise_pred, t, latents, **extra_step_kwargs
-                ).prev_sample
+                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+
+                if num_channels_unet == 4:
+                    init_latents_proper = image_latents
+                    if do_classifier_free_guidance:
+                        init_mask, _ = mask.chunk(2)
+                    else:
+                        init_mask = mask
+
+                    if i < len(timesteps) - 1:
+                        noise_timestep = timesteps[i + 1]
+                        init_latents_proper = self.scheduler.add_noise(
+                            init_latents_proper, noise, torch.tensor([noise_timestep])
+                        )
+
+                    latents = (1 - init_mask) * init_latents_proper + init_mask * latents
 
             # scale and decode the image latents with vae
-            latents = 1 / 0.18215 * latents
+            latents = latents / self.scaling_factor
 
             latents = latents.type(dtype=torch.float32)
             inputs = [
                 pb_utils.Tensor.from_dlpack(
                     "latent_sample", torch.to_dlpack(latents)
+                ),
+                pb_utils.Tensor.from_dlpack(
+                    "return_dict", torch.to_dlpack(False)
                 )
             ]
             inference_request = pb_utils.InferenceRequest(
@@ -378,3 +559,222 @@ class TritonPythonModel:
             tensor_output = [pb_utils.Tensor("IMAGES", image)]
             responses.append(pb_utils.InferenceResponse(tensor_output))
         return responses
+    
+    def prepare_latents(
+        self, 
+        batch_size: int,
+        num_channels_latents: int,
+        height: int,
+        width: int,
+        dtype: torch.dtype,
+        device: str,
+        generator: torch.Generator,
+        latents: torch.Tensor = None,
+        image: torch.Tensor = None,
+        timestep: torch.Tensor = None,
+        is_strength_max: bool = False,
+        add_noise: bool = True,
+        return_noise: bool = False,
+        return_image_latents: bool = False,
+    ):
+        shape = (batch_size, num_channels_latents, height // self.vae_scale_factor, width // self.vae_scale_factor)
+        if isinstance(generator, list) and len(generator) != batch_size:
+            raise ValueError(
+                f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
+                f" size of {batch_size}. Make sure the batch size matches the length of the generators."
+            )
+
+        if (image is None or timestep is None) and not is_strength_max:
+            raise ValueError(
+                "Since strength < 1. initial latents are to be initialised as a combination of Image + Noise."
+                "However, either the image or the noise timestep has not been provided."
+            )
+
+        if image.shape[1] == 4:
+            image_latents = image.to(device=device, dtype=dtype)
+            image_latents = image_latents.repeat(batch_size // image_latents.shape[0], 1, 1, 1)
+        elif return_image_latents or (latents is None and not is_strength_max):
+            image = image.to(device=device, dtype=dtype)
+            image_latents = self._encode_vae_image(image=image, generator=generator)
+            image_latents = image_latents.repeat(batch_size // image_latents.shape[0], 1, 1, 1)
+
+        if latents is None and add_noise:
+            noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            # if strength is 1. then initialise the latents to noise, else initial to image + noise
+            latents = noise if is_strength_max else self.scheduler.add_noise(image_latents, noise, timestep)
+            # if pure noise then scale the initial latents by the  Scheduler's init sigma
+            latents = latents * self.scheduler.init_noise_sigma if is_strength_max else latents
+        elif add_noise:
+            noise = latents.to(device)
+            latents = noise * self.scheduler.init_noise_sigma
+        else:
+            noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            latents = image_latents.to(device)
+
+        outputs = (latents,)
+
+        if return_noise:
+            outputs += (noise,)
+
+        if return_image_latents:
+            outputs += (image_latents,)
+
+        return outputs
+    
+    def _encode_vae_image(self, image: torch.Tensor, generator: torch.Generator):
+        dtype = image.dtype
+        if self.vae.config.force_upcast:
+            image = image.float()
+            self.vae.to(dtype=torch.float32)
+
+        if isinstance(generator, list):
+            image_latents = [
+                self.inference_triton_vae_latents(image[i : i + 1], generator=generator[i])
+                for i in range(image.shape[0])
+            ]
+            image_latents = torch.cat(image_latents, dim=0)
+        else:
+            image_latents = self.inference_triton_vae_latents(image, generator=generator)
+
+        image_latents = image_latents.to(dtype)
+        image_latents = self.vae.config.scaling_factor * image_latents
+
+        return image_latents
+    
+    def inference_triton_vae_latents(
+        self,
+        image: Any,
+        generator: Any,
+        return_dict: bool = False,
+    ):
+        inputs = [
+            pb_utils.Tensor.from_dlpack(
+                "sample", torch.to_dlpack(image)
+            ),
+            pb_utils.Tensor.from_dlpack("return_dict", torch.to_dlpack(return_dict)),
+        ]
+
+        inference_request = pb_utils.InferenceRequest(
+            model_name="vae_encode",
+            requested_output_names=["out_sample"],
+            inputs=inputs,
+        )
+        inference_response = inference_request.exec()
+        if inference_response.has_error():
+            raise pb_utils.TritonModelException(
+                inference_response.error().message()
+            )
+        else:
+            output = pb_utils.get_output_tensor_by_name(
+                inference_response, "out_sample"
+            )
+            latents: torch.Tensor = torch.from_dlpack(output.to_dlpack())
+
+        return latents
+
+    def prepare_mask_latents(
+        self, mask, masked_image, batch_size, height, width, dtype, device, generator, do_classifier_free_guidance
+    ):
+        mask = torch.nn.functional.interpolate(
+            mask, size=(height // self.vae_scale_factor, width // self.vae_scale_factor)
+        )
+        mask = mask.to(device=device, dtype=dtype)
+
+        # duplicate mask and masked_image_latents for each generation per prompt, using mps friendly method
+        if mask.shape[0] < batch_size:
+            if not batch_size % mask.shape[0] == 0:
+                raise ValueError(
+                    "The passed mask and the required batch size don't match. Masks are supposed to be duplicated to"
+                    f" a total batch size of {batch_size}, but {mask.shape[0]} masks were passed. Make sure the number"
+                    " of masks that you pass is divisible by the total requested batch size."
+                )
+            mask = mask.repeat(batch_size // mask.shape[0], 1, 1, 1)
+
+        mask = torch.cat([mask] * 2) if do_classifier_free_guidance else mask
+
+        if masked_image is not None and masked_image.shape[1] == 4:
+            masked_image_latents = masked_image
+        else:
+            masked_image_latents = None
+
+        if masked_image is not None:
+            if masked_image_latents is None:
+                masked_image = masked_image.to(device=device, dtype=dtype)
+                masked_image_latents = self._encode_vae_image(masked_image, generator=generator)
+
+            if masked_image_latents.shape[0] < batch_size:
+                if not batch_size % masked_image_latents.shape[0] == 0:
+                    raise ValueError(
+                        "The passed images and the required batch size don't match. Images are supposed to be duplicated"
+                        f" to a total batch size of {batch_size}, but {masked_image_latents.shape[0]} images were passed."
+                        " Make sure the number of images that you pass is divisible by the total requested batch size."
+                    )
+                masked_image_latents = masked_image_latents.repeat(
+                    batch_size // masked_image_latents.shape[0], 1, 1, 1
+                )
+
+            masked_image_latents = (
+                torch.cat([masked_image_latents] * 2) if do_classifier_free_guidance else masked_image_latents
+            )
+
+            # aligning device to prevent device errors when concating it with the latent model input
+            masked_image_latents = masked_image_latents.to(device=device, dtype=dtype)
+
+        return mask, masked_image_latents
+    
+    def prepare_extra_step_kwargs(self, generator, eta):
+        accepts_eta = "eta" in set(inspect.signature(self.scheduler.step).parameters.keys())
+        extra_step_kwargs = {}
+        if accepts_eta:
+            extra_step_kwargs["eta"] = eta
+
+        # check if the scheduler accepts generator
+        accepts_generator = "generator" in set(inspect.signature(self.scheduler.step).parameters.keys())
+        if accepts_generator:
+            extra_step_kwargs["generator"] = generator
+        return extra_step_kwargs
+
+    def _get_add_time_ids(
+        self,
+        original_size,
+        crops_coords_top_left,
+        target_size,
+        aesthetic_score,
+        negative_aesthetic_score,
+        negative_original_size,
+        negative_crops_coords_top_left,
+        negative_target_size,
+        dtype,
+        text_encoder_projection_dim=None,
+    ):
+        add_time_ids = list(original_size + crops_coords_top_left + target_size)
+        add_neg_time_ids = list(negative_original_size + crops_coords_top_left + negative_target_size)
+
+        passed_add_embed_dim = (
+            256 * len(add_time_ids) + text_encoder_projection_dim
+        )
+        expected_add_embed_dim = 2816 # self.unet.add_embedding.linear_1.in_features
+
+        if (
+            expected_add_embed_dim > passed_add_embed_dim
+            and (expected_add_embed_dim - passed_add_embed_dim) == 256 # self.unet.config.addition_time_embed_dim
+        ):
+            raise ValueError(
+                f"Model expects an added time embedding vector of length {expected_add_embed_dim}, but a vector of {passed_add_embed_dim} was created. Please make sure to enable `requires_aesthetics_score` with `pipe.register_to_config(requires_aesthetics_score=True)` to make sure `aesthetic_score` {aesthetic_score} and `negative_aesthetic_score` {negative_aesthetic_score} is correctly used by the model."
+            )
+        elif (
+            expected_add_embed_dim < passed_add_embed_dim
+            and (passed_add_embed_dim - expected_add_embed_dim) == 256 # self.unet.config.addition_time_embed_dim
+        ):
+            raise ValueError(
+                f"Model expects an added time embedding vector of length {expected_add_embed_dim}, but a vector of {passed_add_embed_dim} was created. Please make sure to disable `requires_aesthetics_score` with `pipe.register_to_config(requires_aesthetics_score=False)` to make sure `target_size` {target_size} is correctly used by the model."
+            )
+        elif expected_add_embed_dim != passed_add_embed_dim:
+            raise ValueError(
+                f"Model expects an added time embedding vector of length {expected_add_embed_dim}, but a vector of {passed_add_embed_dim} was created. The model has an incorrect config. Please check `unet.config.time_embedding_type` and `text_encoder_2.config.projection_dim`."
+            )
+
+        add_time_ids = torch.tensor([add_time_ids], dtype=dtype)
+        add_neg_time_ids = torch.tensor([add_neg_time_ids], dtype=dtype)
+
+        return add_time_ids, add_neg_time_ids

@@ -12,6 +12,10 @@ from torch.onnx import export
 from diffusers import OnnxRuntimeModel, OnnxStableDiffusionPipeline, StableDiffusionPipeline
 from diffusers import StableDiffusionXLInpaintPipeline
 
+from src.models.modeling_clip import CLIPTextModel as CLIPTextModel_SDXL
+from src.models.modeling_clip import CLIPTextModelWithProjection as CLIPTextModelWithProjection_SDXL
+
+from src.models.wrapped import WrappedTextEncoder
 from diffusers import AutoencoderKL
 from transformers import (
     CLIPImageProcessor,
@@ -75,6 +79,7 @@ def convert_models(
     opset: int, 
     fp16: bool = False
 ):
+    print("Convert to fp16: ", fp16)
     dtype = torch.float16 if fp16 else torch.float32
     if fp16 and torch.cuda.is_available():
         device = "cuda"
@@ -86,14 +91,24 @@ def convert_models(
     pipeline: StableDiffusionXLInpaintPipeline = StableDiffusionXLInpaintPipeline.from_pretrained(
         BASE_MODEL,
         torch_dtype=dtype, 
-        variant="fp16",
+        # variant="fp16",
         cache_dir=HUGGINGFACE_CACHED,
         use_safetensors=True
     ).to(device)
 
     output_path = Path(output_path)
-
+     
     # TEXT ENCODER 1
+    pipeline.text_encoder = CLIPTextModel_SDXL.from_pretrained(
+        BASE_MODEL,
+        subfolder='text_encoder',
+        torch_dtype=dtype,
+        cache_dir=HUGGINGFACE_CACHED,
+        use_safetensors=True,
+    ).to(device)
+    
+    # text_encoder = WrappedTextEncoder(pipeline.text_encoder).to(device)
+    
     num_tokens = pipeline.text_encoder.config.max_position_embeddings
     text_hidden_size = pipeline.text_encoder.config.hidden_size
     text_input = pipeline.tokenizer(
@@ -103,12 +118,13 @@ def convert_models(
         truncation=True,
         return_tensors="pt",
     )
+    
     onnx_export(
         pipeline.text_encoder,
         model_args=(text_input.input_ids.to(device=device, dtype=torch.int32)),
         output_path=output_path / "text_encoder" / "model.onnx",
         ordered_input_names=["input_ids"],
-        output_names=["last_hidden_state", "pooler_output"],
+        output_names=["last_hidden_state", "pooler_output", "hidden_states"],
         dynamic_axes={
             "input_ids": {0: "batch", 1: "sequence"},
         },
@@ -127,7 +143,14 @@ def convert_models(
         return_tensors="pt",
     )
 
-    text_encoder_2 = pipeline.text_encoder_2
+    # text_encoder_2 = pipeline.text_encoder_2
+    text_encoder_2 = CLIPTextModelWithProjection_SDXL.from_pretrained(
+        BASE_MODEL,
+        subfolder='text_encoder_2',
+        torch_dtype=torch.float32,
+        cache_dir=HUGGINGFACE_CACHED,
+    )
+    
     image_encoder = pipeline.image_encoder
 
     if image_encoder is not None:
@@ -138,7 +161,8 @@ def convert_models(
                 "image_encoder": (image_encoder, CLIPVisionWithProjectionOnnxConfig(image_encoder.config)),
             },
             output_dir=OUTPUT_DIR,
-            dtype="fp16"
+            # dtype="fp16" if fp16 else "fp32",
+            device=device
         )
         end_time = time.time()
         # Elements: [['input_ids'], ['pixel_values']]
@@ -152,7 +176,7 @@ def convert_models(
             onnx_named_outputs=[['text_embeds']],
             output_dir=Path(OUTPUT_DIR),
             onnx_files_subpaths=["text_encoder_2.onnx"],
-            device="cpu",
+            device=device,
         )
 
         validate_models_outputs(
@@ -160,7 +184,7 @@ def convert_models(
             onnx_named_outputs=[['image_embeds', 'last_hidden_state']],
             output_dir=Path(OUTPUT_DIR),
             onnx_files_subpaths=["image_encoder.onnx"],
-            device="cpu",
+            device=device,
         )
     else:
         start_time = time.time()
@@ -169,7 +193,8 @@ def convert_models(
                 "text_encoder_2": (text_encoder_2, CLIPTextModelWithProjectionOnnxConfig(text_encoder_2.config)),
             },
             output_dir=OUTPUT_DIR,
-            dtype="fp16"
+            dtype="fp16",
+            device=device
         )
         end_time = time.time()
         print(f"Export completed in {end_time - start_time:.2f} seconds.")
@@ -179,7 +204,7 @@ def convert_models(
             onnx_named_outputs=[['text_embeds']],
             output_dir=Path(OUTPUT_DIR),
             onnx_files_subpaths=["text_encoder_2.onnx"],
-            device="cpu",
+            # device=device,
         )
 
     end_time = time.time()
@@ -205,7 +230,7 @@ def convert_models(
         model_args=(
             torch.randn(2, unet_in_channels, unet_sample_size, unet_sample_size).to(device=device, dtype=dtype),
             torch.randn(2).to(device=device, dtype=dtype),
-            torch.randn(2, num_tokens, cross_attention_dim).to(device=device, dtype=dtype),
+            torch.randn(2, 77, cross_attention_dim).to(device=device, dtype=dtype),
             torch.randn(2, text_hidden_size, dtype=dtype).to(device),
             torch.randint(0, 100, (2, 6)).to(dtype).to(device),
             False,
@@ -237,7 +262,7 @@ def convert_models(
         unet_model_path,
         save_as_external_data=True,
         all_tensors_to_one_file=True,
-        location="model.onnx_data",
+        location="weights.pb",
         convert_attribute=False,
     )
     del pipeline.unet

@@ -33,4 +33,6 @@ class CLIPTextModelWithProjectionOnnxConfig(CLIPTextOnnxConfig):
     def outputs(self) -> Dict[str, Dict[int, str]]:
         return {
             "text_embeds": {0: "batch_size"},
+            "last_hidden_state": {0: "batch_size", 1: "sequence_length"},
+            "hidden_states": {0: "batch_size", 1: "sequence_length"},
         }
