@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict, List, Union
 
 import json
-
+import numpy as np
 import torch
 from transformers import CLIPTokenizer
 from diffusers.schedulers import (
@@ -17,10 +17,9 @@ from diffusers.schedulers import (
     LMSDiscreteScheduler,
     PNDMScheduler,
 )
-from diffusers import StableDiffusionXLInpaintPipeline
-from optimum.onnxruntime import ORTStableDiffusionXLInpaintPipeline
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.utils.torch_utils import randn_tensor
+from PIL import Image
 
 try:
     # noinspection PyUnresolvedReferences
@@ -87,10 +86,13 @@ class TritonPythonModel:
         self.width = 1024
         self.num_inference_steps = 20
         self.guidance_scale = 8.0
-        self.strength = 0.9999
+        self.strength = 0.999
         self.eta = 0.0
         self.scaling_factor = 0.13025
         self.text_encoder_projection_dim = 1280
+        self.vae_latent_channels = 4
+        self.unet_in_channels = 9
+        self.vae_force_upcast = False
 
 
     def execute(self, requests) -> "List[List[pb_utils.Tensor]]":
@@ -99,24 +101,15 @@ class TritonPythonModel:
         :param requests: 1 or more requests received by Triton server.
         :return: text as input tensors
         """
-        from optimum.onnxruntime import ORTStableDiffusionXLInpaintPipeline
         responses = []
         # for loop for batch requests (disabled in our case)
         for request in requests:
             
-            image = [
-                t.decode("UTF-8")
-                for t in pb_utils.get_input_tensor_by_name(request, "IMAGE")
-                .as_numpy()
-                .tolist()
-            ]
+            image_tensor = pb_utils.get_input_tensor_by_name(request, "IMAGE")
+            image = image_tensor.as_numpy()
 
-            mask_image = [
-                t.decode("UTF-8")
-                for t in pb_utils.get_input_tensor_by_name(request, "MASK_IMAGE")
-                .as_numpy()
-                .tolist()
-            ]
+            mask_tensor = pb_utils.get_input_tensor_by_name(request, "MASK_IMAGE")
+            mask_image = mask_tensor.as_numpy()
 
             prompt = [
                 t.decode("UTF-8")
@@ -124,6 +117,10 @@ class TritonPythonModel:
                 .as_numpy()
                 .tolist()
             ]
+            
+            logging.error(f"PROMPTTTTTT {prompt}")
+            
+            
             negative_prompt = [
                 t.decode("UTF-8")
                 for t in pb_utils.get_input_tensor_by_name(request, "NEGATIVE_PROMPT")
@@ -205,10 +202,13 @@ class TritonPythonModel:
                 inputs = [
                     pb_utils.Tensor.from_dlpack("input_ids", torch.to_dlpack(input_ids))
                 ]
+                
+                requested_output_name = ["last_hidden_state", "pooler_output", "hidden_states"] if text_encoder == "text_encoder" \
+                    else ["text_embeds", "last_hidden_state", "hidden_states"]
 
                 inference_request = pb_utils.InferenceRequest(
                     model_name=text_encoder,
-                    requested_output_names=["last_hidden_state"],
+                    requested_output_names=requested_output_name,
                     inputs=inputs,
                 )
                 inference_response = inference_request.exec()
@@ -217,14 +217,31 @@ class TritonPythonModel:
                         inference_response.error().message()
                     )
                 else:
-                    output = pb_utils.get_output_tensor_by_name(
-                        inference_response, "last_hidden_state"
-                    )
-                    prompt_embeds: torch.Tensor = torch.from_dlpack(output.to_dlpack())
-
-                pooled_prompt_embeds = prompt_embeds[0]
-
-                prompt_embeds = prompt_embeds.hidden_states[-2]
+                    if text_encoder == "text_encoder":
+                        output = pb_utils.get_output_tensor_by_name(
+                            inference_response, "last_hidden_state"
+                        )
+                        output_pooler = pb_utils.get_output_tensor_by_name(
+                            inference_response, "pooler_output"
+                        )
+                        output_hidden_states = pb_utils.get_output_tensor_by_name(
+                            inference_response, "hidden_states"
+                        )
+                        pooled_prompt_embeds = torch.from_dlpack(output.to_dlpack())
+                        
+                        prompt_embeds: torch.Tensor = torch.from_dlpack(output_hidden_states.to_dlpack())
+                    else:
+                        output = pb_utils.get_output_tensor_by_name(
+                            inference_response, "text_embeds"
+                        )
+                        output_pooler = pb_utils.get_output_tensor_by_name(
+                            inference_response, "last_hidden_state"
+                        )
+                        output_hidden_states = pb_utils.get_output_tensor_by_name(
+                            inference_response, "hidden_states"
+                        )
+                        pooled_prompt_embeds = torch.from_dlpack(output.to_dlpack())
+                        prompt_embeds: torch.Tensor = torch.from_dlpack(output_hidden_states.to_dlpack())
 
                 prompt_embeds_list.append(prompt_embeds)
 
@@ -234,7 +251,7 @@ class TritonPythonModel:
             zero_out_negative_prompt = negative_prompt is None or negative_prompt == "NONE"
             if do_classifier_free_guidance and zero_out_negative_prompt:
                 negative_prompt = negative_prompt or ""
-                negative_prompt_2 = negative_prompt_2 or negative_prompt
+                negative_prompt_2 = negative_prompt
             
                 # normalize str to list
                 negative_prompt = batch_size * [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
@@ -273,14 +290,17 @@ class TritonPythonModel:
                     #     output_hidden_states=True,
                     # )
 
-                    input_ids = uncond_input.type(dtype=torch.int32)
+                    input_ids = uncond_input.input_ids.type(dtype=torch.int32)
                     inputs = [
                         pb_utils.Tensor.from_dlpack("input_ids", torch.to_dlpack(input_ids))
                     ]
+                    
+                    requested_output_name = ["last_hidden_state", "pooler_output", "hidden_states"] if text_encoder == "text_encoder" \
+                        else ["text_embeds", "last_hidden_state", "hidden_states"]
 
                     inference_request = pb_utils.InferenceRequest(
                         model_name=text_encoder,
-                        requested_output_names=["last_hidden_state"],
+                        requested_output_names=requested_output_name,
                         inputs=inputs,
                     )
                     inference_response = inference_request.exec()
@@ -288,16 +308,25 @@ class TritonPythonModel:
                         raise pb_utils.TritonModelException(
                             inference_response.error().message()
                         )
-                    else:
-                        output = pb_utils.get_output_tensor_by_name(
-                            inference_response, "last_hidden_state"
-                        )
-                        negative_prompt_embeds: torch.Tensor = torch.from_dlpack(output.to_dlpack())
-
-
-                    # We are only ALWAYS interested in the pooled output of the final text encoder
-                    negative_pooled_prompt_embeds = negative_prompt_embeds[0]
-                    negative_prompt_embeds = negative_prompt_embeds.hidden_states[-2]
+                    else:                        
+                        if text_encoder == "text_encoder":
+                            output = pb_utils.get_output_tensor_by_name(
+                                inference_response, "last_hidden_state"
+                            )
+                            
+                            output_hidden_states = pb_utils.get_output_tensor_by_name(
+                                inference_response, "hidden_states"
+                            )
+                        else:
+                            output = pb_utils.get_output_tensor_by_name(
+                                inference_response, "text_embeds"
+                            )
+                            output_hidden_states = pb_utils.get_output_tensor_by_name(
+                                inference_response, "hidden_states"
+                            )
+                        
+                    negative_pooled_prompt_embeds: torch.Tensor = torch.from_dlpack(output.to_dlpack())
+                    negative_prompt_embeds = torch.from_dlpack(output_hidden_states.to_dlpack())
 
                     negative_prompt_embeds_list.append(negative_prompt_embeds)
 
@@ -344,8 +373,10 @@ class TritonPythonModel:
             # 5. Preprocess mask and image
             init_image = self.image_processor.preprocess(image, height=self.height, width=self.width)
             init_image = init_image.to(dtype=torch.float32)
-
+            
+            mask_image = Image.fromarray(mask_image.squeeze().astype(np.uint8))
             mask = self.mask_processor.preprocess(mask_image, height=self.height, width=self.width)
+            test_mask = mask.clone() # 1, 3, 1024, 1024
             
             if init_image.shape[1] == 4:
                 # if images are in latent space, we can't mask it
@@ -354,11 +385,12 @@ class TritonPythonModel:
                 masked_image = init_image * (mask < 0.5)
 
             # 6. Prepare latent variables
-            num_channels_latents = self.vae.config.latent_channels
-            num_channels_unet = self.unet.config.in_channels
+            num_channels_latents = self.vae_latent_channels
+            num_channels_unet = self.unet_in_channels
             return_image_latents = num_channels_unet == 4
 
             add_noise = True
+            latents = None
             latents_outputs = self.prepare_latents(
                 batch_size * num_images_per_prompt,
                 num_channels_latents,
@@ -380,6 +412,7 @@ class TritonPythonModel:
                 latents, noise, image_latents = latents_outputs
             else:
                 latents, noise = latents_outputs
+                
 
             mask, masked_image_latents = self.prepare_mask_latents(
                 mask,
@@ -398,13 +431,13 @@ class TritonPythonModel:
                 # default case for runwayml/stable-diffusion-inpainting
                 num_channels_mask = mask.shape[1]
                 num_channels_masked_image = masked_image_latents.shape[1]
-                if num_channels_latents + num_channels_mask + num_channels_masked_image != self.unet.config.in_channels:
+                if num_channels_latents + num_channels_mask + num_channels_masked_image != 9: # self.unet.config.in_channels:
                     raise ValueError(
-                        f"Incorrect configuration settings! The config of `pipeline.unet`: {self.unet.config} expects"
-                        f" {self.unet.config.in_channels} but received `num_channels_latents`: {num_channels_latents} +"
+                        f"{mask.shape}, {masked_image_latents.shape}, {test_mask.shape} Incorrect configuration settings! The config of `pipeline.unet`: expects"
+                        f" {9} but received `num_channels_latents`: {num_channels_latents} +"
                         f" `num_channels_mask`: {num_channels_mask} + `num_channels_masked_image`: {num_channels_masked_image}"
                         f" = {num_channels_latents+num_channels_masked_image+num_channels_mask}. Please verify the config of"
-                        " `pipeline.unet` or your `mask_image` or `image` input."
+                        " `pipeline.unet` or your `mask_image` or `image` input. "
                     )
             elif num_channels_unet != 4:
                 raise ValueError(
@@ -418,9 +451,13 @@ class TritonPythonModel:
             height = height * self.vae_scale_factor
             width = width * self.vae_scale_factor
 
+            original_size = None
+            target_size = None
             original_size = original_size or (height, width)
             target_size = target_size or (height, width)
 
+            negative_original_size = None
+            negative_target_size = None
             # 10. Prepare added time ids & embeddings
             if negative_original_size is None:
                 negative_original_size = original_size
@@ -431,14 +468,14 @@ class TritonPythonModel:
             text_encoder_projection_dim = self.text_encoder_projection_dim
 
             add_time_ids, add_neg_time_ids = self._get_add_time_ids(
-                original_size,
+                original_size=original_size,
                 crops_coords_top_left=(0,0),
-                target_size=None,
+                target_size=target_size,
                 aesthetic_score=6.0,
                 negative_aesthetic_score=2.5,
-                negative_original_size=None,
+                negative_original_size=negative_original_size,
                 negative_crops_coords_top_left=(0, 0),
-                negative_target_size=None,
+                negative_target_size=negative_target_size,
                 dtype=prompt_embeds.dtype,
                 text_encoder_projection_dim=text_encoder_projection_dim,
             )
@@ -459,11 +496,12 @@ class TritonPythonModel:
             # 11.1 Optionally get Guidance Scale Embedding
             timestep_cond = None
             self._num_timesteps = len(timesteps)
-
-
+            
+            # Check from here
+            
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
-                latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
+                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
 
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
@@ -474,19 +512,17 @@ class TritonPythonModel:
                     pb_utils.Tensor.from_dlpack(
                         "sample", torch.to_dlpack(latent_model_input)
                     ),
-                    pb_utils.Tensor.from_dlpack("timestep", torch.to_dlpack(t)),
+                    pb_utils.Tensor.from_dlpack(
+                        "timestep", torch.to_dlpack(t.to(torch.float16).unsqueeze(0))),
                     pb_utils.Tensor.from_dlpack(
                         "encoder_hidden_states", torch.to_dlpack(prompt_embeds)
                     ),
                     pb_utils.Tensor.from_dlpack(
-                        "text_embeds", torch.to_dlpack(add_text_embeds)
+                        "text_embeds", torch.to_dlpack(add_text_embeds.to(torch.float16))
                     ),
                     pb_utils.Tensor.from_dlpack(
-                        "time_ids", torch.to_dlpack(add_time_ids)
+                        "time_ids", torch.to_dlpack(add_time_ids.to(torch.float16))
                     ),
-                    pb_utils.Tensor.from_dlpack(
-                        "return_dict", torch.to_dlpack(False)
-                    )
                 ]
 
                 inference_request = pb_utils.InferenceRequest(
@@ -529,16 +565,15 @@ class TritonPythonModel:
 
             # scale and decode the image latents with vae
             latents = latents / self.scaling_factor
-
+            
             latents = latents.type(dtype=torch.float32)
+            
             inputs = [
                 pb_utils.Tensor.from_dlpack(
-                    "latent_sample", torch.to_dlpack(latents)
+                    "latent_sample", torch.to_dlpack(latents.to(torch.float16))
                 ),
-                pb_utils.Tensor.from_dlpack(
-                    "return_dict", torch.to_dlpack(False)
-                )
             ]
+            
             inference_request = pb_utils.InferenceRequest(
                 model_name="vae_decoder",
                 requested_output_names=["sample"],
@@ -599,7 +634,7 @@ class TritonPythonModel:
             image_latents = image_latents.repeat(batch_size // image_latents.shape[0], 1, 1, 1)
 
         if latents is None and add_noise:
-            noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            noise = randn_tensor(shape, generator=generator, device=torch.device(device), dtype=dtype)
             # if strength is 1. then initialise the latents to noise, else initial to image + noise
             latents = noise if is_strength_max else self.scheduler.add_noise(image_latents, noise, timestep)
             # if pure noise then scale the initial latents by the  Scheduler's init sigma
@@ -623,7 +658,7 @@ class TritonPythonModel:
     
     def _encode_vae_image(self, image: torch.Tensor, generator: torch.Generator):
         dtype = image.dtype
-        if self.vae.config.force_upcast:
+        if self.vae_force_upcast:
             image = image.float()
             self.vae.to(dtype=torch.float32)
 
@@ -637,7 +672,7 @@ class TritonPythonModel:
             image_latents = self.inference_triton_vae_latents(image, generator=generator)
 
         image_latents = image_latents.to(dtype)
-        image_latents = self.vae.config.scaling_factor * image_latents
+        image_latents = self.scaling_factor * image_latents
 
         return image_latents
     
@@ -649,14 +684,13 @@ class TritonPythonModel:
     ):
         inputs = [
             pb_utils.Tensor.from_dlpack(
-                "sample", torch.to_dlpack(image)
-            ),
-            pb_utils.Tensor.from_dlpack("return_dict", torch.to_dlpack(return_dict)),
+                "sample", torch.to_dlpack(image.contiguous())
+            )        
         ]
 
         inference_request = pb_utils.InferenceRequest(
-            model_name="vae_encode",
-            requested_output_names=["out_sample"],
+            model_name="vae_encoder",
+            requested_output_names=["latent_sample"],
             inputs=inputs,
         )
         inference_response = inference_request.exec()
@@ -666,7 +700,7 @@ class TritonPythonModel:
             )
         else:
             output = pb_utils.get_output_tensor_by_name(
-                inference_response, "out_sample"
+                inference_response, "latent_sample"
             )
             latents: torch.Tensor = torch.from_dlpack(output.to_dlpack())
 
