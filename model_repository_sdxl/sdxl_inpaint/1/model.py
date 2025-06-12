@@ -76,8 +76,7 @@ class TritonPythonModel:
         self.scheduler = EulerDiscreteScheduler.from_config(self.scheduler_config_path)
 
         self.vae_scale_factor = 8
-
-        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
+        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor, do_normalize=True)
         self.mask_processor = VaeImageProcessor(
             vae_scale_factor=self.vae_scale_factor, do_normalize=False, do_binarize=True, do_convert_grayscale=True
         )
@@ -370,6 +369,9 @@ class TritonPythonModel:
             # create a boolean to check if the strength is set to 1. if so then initialise the latents with pure noise
             is_strength_max = self.strength == 1.0
 
+            from PIL import Image
+
+            image = Image.fromarray(image.squeeze().astype(np.uint8))
             # 5. Preprocess mask and image
             init_image = self.image_processor.preprocess(image, height=self.height, width=self.width)
             init_image = init_image.to(dtype=torch.float32)
@@ -387,7 +389,7 @@ class TritonPythonModel:
             # 6. Prepare latent variables
             num_channels_latents = self.vae_latent_channels
             num_channels_unet = self.unet_in_channels
-            return_image_latents = num_channels_unet == 4
+            return_image_latents = num_channels_unet == 4 # False
 
             add_noise = True
             latents = None
@@ -498,11 +500,11 @@ class TritonPythonModel:
             self._num_timesteps = len(timesteps)
             
             # Check from here
-            
+            test_output = [] 
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
-
+                test_output.append([latent_model_input.max(), latent_model_input.min()])
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 if num_channels_unet == 9:
@@ -625,10 +627,7 @@ class TritonPythonModel:
                 "However, either the image or the noise timestep has not been provided."
             )
 
-        if image.shape[1] == 4:
-            image_latents = image.to(device=device, dtype=dtype)
-            image_latents = image_latents.repeat(batch_size // image_latents.shape[0], 1, 1, 1)
-        elif return_image_latents or (latents is None and not is_strength_max):
+        if return_image_latents or (latents is None and not is_strength_max):
             image = image.to(device=device, dtype=dtype)
             image_latents = self._encode_vae_image(image=image, generator=generator)
             image_latents = image_latents.repeat(batch_size // image_latents.shape[0], 1, 1, 1)
@@ -682,6 +681,7 @@ class TritonPythonModel:
         generator: Any,
         return_dict: bool = False,
     ):
+
         inputs = [
             pb_utils.Tensor.from_dlpack(
                 "sample", torch.to_dlpack(image.contiguous())

@@ -37,7 +37,7 @@ samples = 1 # no.of images to generate
 scheduler = "EulerDiscreteScheduler"
 steps = 20
 guidance_scale = 8.0
-seed = 42
+seed = 100042
 
 start_time = time.time()
 
