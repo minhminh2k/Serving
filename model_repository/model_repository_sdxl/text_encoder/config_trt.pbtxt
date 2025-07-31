@@ -1,0 +1,50 @@
+name: "text_encoder"
+platform: "tensorrt_plan"
+max_batch_size: 2
+
+input [
+  {
+    name: "input_ids"
+    data_type: TYPE_INT32
+    dims: [ -1 ]
+  }
+]
+output [
+  {
+    name: "last_hidden_state"
+    data_type: TYPE_FP16
+    dims: [ -1, 768 ]
+  },
+  {
+    name: "pooler_output"
+    data_type: TYPE_FP16
+    dims: [ 768 ]
+  },
+  {
+    name: "hidden_states"
+    data_type: TYPE_FP16
+    dims: [ -1, 768 ]
+  }
+]
+
+instance_group [
+  {
+    kind: KIND_GPU
+  }
+]
+
+optimization {
+  execution_accelerators {
+    gpu_execution_accelerator {
+      name: "tensorrt"
+    }
+  }
+  graph {
+    level: 1
+  }
+}
+
+parameters: {
+  key: "TF_ENABLE_TENSORRT"
+  value: { string_value: "1" }
+}
