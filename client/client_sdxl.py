@@ -31,15 +31,14 @@ mask_url = Image.open("/home/duong.quang.minh/project/Serving/assets/mask.png")
 image = load_image(img_url).resize((1024, 1024))
 mask_image = load_image(mask_url).resize((1024, 1024))
 
-prompt = "a tiger sitting on a park bench"
+prompt = "a cat is sitting on the bench"
 negative_prompt = "NONE"
-samples = 1 # no.of images to generate
+samples = 1
 scheduler = "EulerDiscreteScheduler"
 steps = 20
 guidance_scale = 8.0
-seed = 100042
+seed = 0
 
-start_time = time.time()
 
 triton_client = tritonclient.http.InferenceServerClient(url=url, verbose=False)
 assert triton_client.is_model_ready(
@@ -73,19 +72,27 @@ steps_in.set_data_from_numpy(np.asarray([steps], dtype=np.int32))
 guidance_scale_in.set_data_from_numpy(np.asarray([guidance_scale], dtype=np.float16))
 seed_in.set_data_from_numpy(np.asarray([seed], dtype=np.int64))
 
+
+start_time = time.time()
+
 response = triton_client.infer(
     model_name=model_name, model_version=model_version, 
     inputs=[image_in, mask_image_in, prompt_in,negative_prompt_in,samples_in,scheduler_in,steps_in,guidance_scale_in,seed_in], 
-    outputs=[images]
+    outputs=[images],
 )
+end_time = time.time()
+print("Processing time:", end_time - start_time)
 
 images = response.as_numpy("IMAGES")
+
+print("Images shape:", images.shape)
+print("Images dtype:", images.dtype)
+print(f"Images min: {images.min()}, max: {images.max()}")
 
 if images.ndim == 3:
     images = images[None, ...]
 images = (images * 255).round().astype("uint8")
 pil_images = [Image.fromarray(image) for image in images]
-
 
 rows = 1 # change according to no.of samples 
 cols = 1 # change according to no.of samples
@@ -93,8 +100,5 @@ cols = 1 # change according to no.of samples
 
 output_image = image_grid(pil_images, rows, cols)
 
-output_image.save("output/output.png")
+output_image.save("assets/outputs/sdxl/tiger.png") # 4.3s for 20 steps
 
-end_time = time.time()
-
-print("Processing time:", end_time - start_time)

@@ -650,11 +650,11 @@ class CLIPTextTransformer(nn.Module):
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
-        return_dict: Optional[bool] = False,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = True,
+        return_dict: Optional[bool] = True,
     ) -> Union[Tuple, BaseModelOutputWithPooling]:
         r"""
         Returns:
@@ -705,7 +705,7 @@ class CLIPTextTransformer(nn.Module):
             # casting to torch.int for onnx compatibility: argmax doesn't support int64 inputs with opset 14
             pooled_output = last_hidden_state[
                 torch.arange(last_hidden_state.shape[0], device=last_hidden_state.device),
-                input_ids.to(dtype=torch.int, device=last_hidden_state.device).argmax(dim=-1),
+                input_ids.to(dtype=torch.int, device=last_hidden_state.device).argmax(dim=-1), # aaaaaa
             ]
         else:
             # The config gets updated `eos_token_id` from PR #24773 (so the use of exta new tokens is possible)
@@ -718,20 +718,14 @@ class CLIPTextTransformer(nn.Module):
             ]
 
         if not return_dict:
-            # hidden_states = encoder_outputs[1][-2]
-            # return last_hidden_state, pooled_output, hidden_states
             return (last_hidden_state, pooled_output) + encoder_outputs[1:]
-
-        print(last_hidden_state.shape)
-        print(pooled_output.shape)
-        print(encoder_outputs.hidden_states[-2].shape)
-        print(encoder_outputs.attentions)
         
-        # return last_hidden_state, pooled_output, encoder_outputs.hidden_states, encoder_outputs.attentions
+        hidden_states = encoder_outputs.hidden_states[-2]
+
         return BaseModelOutputWithPooling(
             last_hidden_state=last_hidden_state, # torch.Size([1, 77, 768])
             pooler_output=pooled_output, # torch.Size([1, 768])
-            hidden_states=encoder_outputs.hidden_states, # tuple: torch.Size([1, 77, 768])
+            hidden_states=hidden_states, # tuple: torch.Size([1, 77, 768])
             attentions=encoder_outputs.attentions, # None
         )
 
@@ -762,11 +756,11 @@ class CLIPTextModel(CLIPPreTrainedModel):
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
-        return_dict: Optional[bool] = True,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = True,
+        return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutputWithPooling]:
         r"""
         Returns:
@@ -785,10 +779,9 @@ class CLIPTextModel(CLIPPreTrainedModel):
         >>> last_hidden_state = outputs.last_hidden_state
         >>> pooled_output = outputs.pooler_output  # pooled (EOS token) states
         ```"""
-        # return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        return_dict = True
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
-        clip_text_transformer_output = self.text_model(
+        return self.text_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -796,11 +789,6 @@ class CLIPTextModel(CLIPPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-        
-        return clip_text_transformer_output.last_hidden_state, \
-            clip_text_transformer_output.pooler_output, \
-            clip_text_transformer_output.hidden_states[-2], \
-            clip_text_transformer_output.attentions
 
 
 class CLIPVisionTransformer(nn.Module):
@@ -1200,8 +1188,6 @@ class CLIPTextModelWithProjection(CLIPPreTrainedModel):
         >>> outputs = model(**inputs)
         >>> text_embeds = outputs.text_embeds
         ```"""
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
         text_outputs = self.text_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1215,25 +1201,15 @@ class CLIPTextModelWithProjection(CLIPPreTrainedModel):
 
         text_embeds = self.text_projection(pooled_output)
         if not return_dict:
-            # text_embeds = text_embeds
-            # last_hidden_state = text_outputs[0]
-            # hidden_states = text_outputs[2]
-            # return text_embeds # , last_hidden_state, hidden_states
-            
             outputs = (text_embeds, text_outputs[0]) + text_outputs[2:]
             return tuple(output for output in outputs if output is not None)
         
         return CLIPTextModelOutput(
             text_embeds=text_embeds,
             last_hidden_state=text_outputs.last_hidden_state,
-            hidden_states=text_outputs.hidden_states[-2],
+            hidden_states=text_outputs.hidden_states,
             attentions=text_outputs.attentions,
         )
-        
-        # return text_embeds, text_outputs.last_hidden_state, \
-        #     text_outputs.hidden_states[-2], text_outputs.attentions
-            
-
 
 @add_start_docstrings(
     """
@@ -1264,8 +1240,8 @@ class CLIPVisionModelWithProjection(CLIPPreTrainedModel):
         self,
         pixel_values: Optional[torch.FloatTensor] = None,
         output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = True,
+        return_dict: Optional[bool] = True,
     ) -> Union[Tuple, CLIPVisionModelOutput]:
         r"""
         Returns:

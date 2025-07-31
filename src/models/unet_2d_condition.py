@@ -816,7 +816,7 @@ class UNet2DConditionModel_SDXL(UNet2DConditionModel):
         encoder_hidden_states: torch.Tensor,
         text_embeds: Optional[torch.Tensor],
         time_ids: Optional[torch.Tensor],
-        return_dict: bool = False,
+        return_dict: bool = True,
         class_labels: Optional[torch.Tensor] = None,
         timestep_cond: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -827,9 +827,6 @@ class UNet2DConditionModel_SDXL(UNet2DConditionModel):
         down_intrablock_additional_residuals: Optional[Tuple[torch.Tensor]] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
     ) -> Union[UNet2DConditionOutput, Tuple]:
-            
-        text_embeds = text_embeds + torch.zeros_like(text_embeds)
-        time_ids = time_ids + torch.zeros_like(time_ids)
         
         default_overall_up_factor = 2**self.num_upsamplers
 

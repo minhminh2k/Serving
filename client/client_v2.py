@@ -23,15 +23,13 @@ model_version = "1"
 batch_size = 1
 
 # model input params
-prompt = "a photo of an astronaut riding a horse on mars"
+prompt = "a photo of a astronaut riding bike on mars"
 negative_prompt = "NONE" # replace NONE with actual negative prompt if any
 samples = 1 # no.of images to generate
 scheduler = "DPMSolverMultistepScheduler"
-steps = 20
+steps = 50
 guidance_scale = 7.5
-seed = 42
-
-start_time = time.time()
+seed = 0
 
 triton_client = tritonclient.http.InferenceServerClient(url=url, verbose=False)
 assert triton_client.is_model_ready(
@@ -61,11 +59,16 @@ steps_in.set_data_from_numpy(np.asarray([steps], dtype=np.int32))
 guidance_scale_in.set_data_from_numpy(np.asarray([guidance_scale], dtype=np.float32))
 seed_in.set_data_from_numpy(np.asarray([seed], dtype=np.int64))
 
+start_time = time.time()
+
 response = triton_client.infer(
     model_name=model_name, model_version=model_version, 
     inputs=[prompt_in,negative_prompt_in,samples_in,scheduler_in,steps_in,guidance_scale_in,seed_in], 
     outputs=[images]
 )
+
+end_time = time.time()
+print("Processing time:", end_time - start_time) # FP32: 3.6s
 
 images = response.as_numpy("IMAGES")
 
@@ -81,8 +84,5 @@ cols = 1 # change according to no.of samples
 
 output_image = image_grid(pil_images, rows, cols)
 
-output_image.save("output/output.png")
+output_image.save("assets/outputs/stable_diffusion_v1_4/astronaut.png")
 
-end_time = time.time()
-
-print("Processing time:", end_time - start_time)
